@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Create a journalist-friendly Markdown report from Michigan assessment extracts.
+"""Create a journalist-friendly Markdown or Word report from Michigan assessment extracts.
 
 Usage:
     python build_score_report.py
     python build_score_report.py --input-dir outputs --output test_score_report.md
+    python build_score_report.py --format docx --output test_score_report.docx
     python build_score_report.py --school-year 2025 --min-assessed 10
 
 The script is based on analyze_scores.py but replaces notebook display/print output
-with one organized Markdown report. It tolerates common suppression markers and
+with one organized Markdown or Word report. It tolerates common suppression markers and
 supports both wide SAT files and long subject-level extracts.
 """
 
@@ -22,11 +23,15 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-
-#for PDF handling
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
+try:
+    from docx import Document
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt, RGBColor
+except ImportError:  # Only required when --format docx is used.
+    Document = None
 
 SUPPRESSED = {"", "*", "**", "--", "---", "—", "N/A", "NA", "<5", "< 5", "nan", "None"}
 RACE_GROUPS = [
@@ -46,12 +51,14 @@ CATEGORY_GROUPS = {
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input-dir", type=Path, default=Path("outputs"), help="Directory containing extract CSVs")
-    p.add_argument("--output", type=Path, default=Path("test_score_report.md"), help="Markdown output path")
+    p.add_argument("--output", type=Path, default=Path("test_score_report.md"),
+                   help="Output path; suffix is adjusted to match --format")
+    p.add_argument("--format", choices=["md", "docx"], default="md",
+                   help="Output format: Markdown or Word (default: md)")
     p.add_argument("--school-year", default=None, help="Optional SchoolYear value to keep, such as 2025")
     p.add_argument("--min-assessed", type=int, default=None,
                    help="Optional minimum NumberAssessed for district rankings; recommended when available")
     p.add_argument("--top-n", type=int, default=10, help="Number of districts in rankings (default: 10)")
-    p.add_argument("--format", choices=["md", "pdf"], default="md", help="Output format (default: md)")
     return p.parse_args()
 
 
@@ -64,54 +71,6 @@ def read_csv(input_dir: Path, name: str, required: bool = True) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str, low_memory=False)
     df.columns = df.columns.str.strip()
     return df
-
-def markdown_to_pdf(markdown_text: str, pdf_path: Path) -> None:
-    """
-    Convert the generated markdown report into a simple,
-    journalist-friendly PDF.
-    """
-    doc = SimpleDocTemplate(str(pdf_path))
-
-    styles = getSampleStyleSheet()
-    body = styles["BodyText"]
-    heading1 = styles["Heading1"]
-    heading2 = styles["Heading2"]
-    heading3 = styles["Heading3"]
-
-    elements = []
-
-    for line in markdown_text.splitlines():
-        line = line.strip()
-
-        if not line:
-            elements.append(Spacer(1, 6))
-            continue
-
-        if line.startswith("# "):
-            elements.append(Paragraph(line[2:], heading1))
-            continue
-
-        if line.startswith("## "):
-            elements.append(Paragraph(line[3:], heading2))
-            continue
-
-        if line.startswith("### "):
-            elements.append(Paragraph(line[4:], heading3))
-            continue
-
-        # Render markdown tables as monospaced text blocks.
-        if line.startswith("|"):
-            elements.append(
-                Paragraph(
-                    f"<font face='Courier'>{line}</font>",
-                    body
-                )
-            )
-            continue
-
-        elements.append(Paragraph(line, body))
-
-    doc.build(elements)
 
 
 def norm(value) -> str:
@@ -296,6 +255,232 @@ def district_rankings(df: pd.DataFrame, score_col: str, label: str, top_n: int,
     return markdown_table(rows, ["Rank", "District", label], {0, 2})
 
 
+
+def _set_cell_shading(cell, fill: str) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = tc_pr.find(qn("w:shd"))
+    if shd is None:
+        shd = OxmlElement("w:shd")
+        tc_pr.append(shd)
+    shd.set(qn("w:fill"), fill)
+
+
+def _set_cell_margins(cell, top=90, start=110, bottom=90, end=110) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    tc_mar = tc_pr.first_child_found_in("w:tcMar")
+    if tc_mar is None:
+        tc_mar = OxmlElement("w:tcMar")
+        tc_pr.append(tc_mar)
+    for name, value in {"top": top, "start": start, "bottom": bottom, "end": end}.items():
+        node = tc_mar.find(qn(f"w:{name}"))
+        if node is None:
+            node = OxmlElement(f"w:{name}")
+            tc_mar.append(node)
+        node.set(qn("w:w"), str(value))
+        node.set(qn("w:type"), "dxa")
+
+
+def _repeat_table_header(row) -> None:
+    tr_pr = row._tr.get_or_add_trPr()
+    tbl_header = OxmlElement("w:tblHeader")
+    tbl_header.set(qn("w:val"), "true")
+    tr_pr.append(tbl_header)
+
+
+def _add_page_number(paragraph) -> None:
+    run = paragraph.add_run()
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instruction = OxmlElement("w:instrText")
+    instruction.set(qn("xml:space"), "preserve")
+    instruction.text = " PAGE "
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    text = OxmlElement("w:t")
+    text.text = "1"
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    run._r.extend([begin, instruction, separate, text, end])
+
+
+def _configure_document(document) -> None:
+    section = document.sections[0]
+    section.top_margin = Inches(0.65)
+    section.bottom_margin = Inches(0.65)
+    section.left_margin = Inches(0.7)
+    section.right_margin = Inches(0.7)
+
+    normal = document.styles["Normal"]
+    normal.font.name = "Aptos"
+    normal.font.size = Pt(10)
+    normal.paragraph_format.space_after = Pt(5)
+    normal.paragraph_format.line_spacing = 1.05
+
+    title = document.styles["Title"]
+    title.font.name = "Aptos Display"
+    title.font.size = Pt(24)
+    title.font.bold = True
+    title.font.color.rgb = RGBColor(31, 78, 121)
+
+    for style_name, color in {
+        "Heading 1": RGBColor(31, 78, 121),
+        "Heading 2": RGBColor(47, 84, 150),
+        "Heading 3": RGBColor(68, 68, 68),
+    }.items():
+        style = document.styles[style_name]
+        style.font.name = "Aptos Display"
+        style.font.color.rgb = color
+        style.font.bold = True
+        style.paragraph_format.keep_with_next = True
+        style.paragraph_format.space_before = Pt(12)
+        style.paragraph_format.space_after = Pt(5)
+
+    footer = section.footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = footer.add_run("Michigan state test score report  |  Page ")
+    run.font.size = Pt(8)
+    run.font.color.rgb = RGBColor(100, 100, 100)
+    _add_page_number(footer)
+
+
+def _add_inline_markdown(paragraph, text: str) -> None:
+    """Render the report's limited inline Markdown as native Word runs."""
+    # Internal Markdown navigation links are unnecessary in Word; retain the label.
+    text = re.sub(r"\[([^]]+)\]\(#[^)]+\)", r"\1", text)
+    token_re = re.compile(r"(\*\*.*?\*\*|`.*?`|“.*?”)")
+    position = 0
+    for match in token_re.finditer(text):
+        if match.start() > position:
+            paragraph.add_run(text[position:match.start()])
+        token = match.group(0)
+        if token.startswith("**"):
+            run = paragraph.add_run(token[2:-2])
+            run.bold = True
+        elif token.startswith("`"):
+            run = paragraph.add_run(token[1:-1])
+            run.font.name = "Consolas"
+            run.font.size = Pt(9)
+        else:
+            paragraph.add_run(token)
+        position = match.end()
+    if position < len(text):
+        paragraph.add_run(text[position:])
+
+
+def _parse_markdown_table(lines: list[str]) -> tuple[list[str], list[list[str]], set[int]]:
+    def split_row(line: str) -> list[str]:
+        return [cell.strip().replace("\\|", "|") for cell in line.strip().strip("|").split("|")]
+    headers = split_row(lines[0])
+    alignment = split_row(lines[1]) if len(lines) > 1 else []
+    numeric_columns = {i for i, cell in enumerate(alignment) if cell.endswith(":")}
+    rows = [split_row(line) for line in lines[2:]]
+    return headers, rows, numeric_columns
+
+
+def _add_word_table(document, headers: list[str], rows: list[list[str]], numeric_columns: set[int]) -> None:
+    table = document.add_table(rows=1, cols=len(headers))
+    table.style = "Light Shading Accent 1"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+    header_row = table.rows[0]
+    _repeat_table_header(header_row)
+
+    for index, header in enumerate(headers):
+        cell = header_row.cells[index]
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        _set_cell_shading(cell, "1F4E79")
+        _set_cell_margins(cell)
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT if index in numeric_columns else WD_ALIGN_PARAGRAPH.LEFT
+        run = paragraph.add_run(header)
+        run.bold = True
+        run.font.color.rgb = RGBColor(255, 255, 255)
+        run.font.size = Pt(9)
+
+    for row_number, values in enumerate(rows):
+        cells = table.add_row().cells
+        for index, cell in enumerate(cells):
+            value = values[index] if index < len(values) else ""
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            _set_cell_margins(cell)
+            if row_number % 2 == 1:
+                _set_cell_shading(cell, "F2F6FA")
+            paragraph = cell.paragraphs[0]
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT if index in numeric_columns else WD_ALIGN_PARAGRAPH.LEFT
+            run = paragraph.add_run(value)
+            run.font.size = Pt(9)
+    document.add_paragraph()
+
+
+def markdown_to_docx(markdown_text: str, output_path: Path) -> None:
+    """Convert this script's structured Markdown into a polished Word report."""
+    if Document is None:
+        raise RuntimeError(
+            "Word output requires python-docx. Install it with: pip install python-docx"
+        )
+
+    document = Document()
+    _configure_document(document)
+    lines = markdown_text.splitlines()
+    index = 0
+    first_h1 = True
+
+    while index < len(lines):
+        raw = lines[index]
+        line = raw.strip()
+        if not line:
+            index += 1
+            continue
+
+        if line.startswith("| "):
+            table_lines = []
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                table_lines.append(lines[index].strip())
+                index += 1
+            if len(table_lines) >= 2:
+                headers, rows, numeric_columns = _parse_markdown_table(table_lines)
+                _add_word_table(document, headers, rows, numeric_columns)
+            continue
+
+        if line.startswith("# "):
+            text = line[2:].strip()
+            if first_h1:
+                paragraph = document.add_paragraph(style="Title")
+                first_h1 = False
+            else:
+                paragraph = document.add_heading(level=1)
+            _add_inline_markdown(paragraph, text)
+        elif line.startswith("## "):
+            paragraph = document.add_heading(level=1)
+            _add_inline_markdown(paragraph, line[3:].strip())
+        elif line.startswith("### "):
+            paragraph = document.add_heading(level=2)
+            _add_inline_markdown(paragraph, line[4:].strip())
+        elif line.startswith("> "):
+            table = document.add_table(rows=1, cols=1)
+            table.style = "Light Shading Accent 1"
+            cell = table.cell(0, 0)
+            _set_cell_shading(cell, "EAF2F8")
+            _set_cell_margins(cell, top=150, start=170, bottom=150, end=170)
+            paragraph = cell.paragraphs[0]
+            _add_inline_markdown(paragraph, line[2:].strip())
+            document.add_paragraph()
+        elif line.startswith("- "):
+            paragraph = document.add_paragraph(style="List Bullet")
+            _add_inline_markdown(paragraph, line[2:].strip())
+        elif line.startswith("_The file") or (line.startswith("_") and line.endswith("_")):
+            paragraph = document.add_paragraph()
+            run = paragraph.add_run(line.strip("_"))
+            run.italic = True
+            run.font.color.rgb = RGBColor(95, 95, 95)
+        else:
+            paragraph = document.add_paragraph()
+            _add_inline_markdown(paragraph, line.replace("  ", " "))
+        index += 1
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    document.save(output_path)
+
 def main() -> int:
     args = parse_args()
     try:
@@ -327,8 +512,9 @@ def main() -> int:
         "# Michigan state test score results\n",
         f"**School year:** {year_label}  \n",
         "**Geographies:** Michigan statewide, Detroit Public Schools Community District and district rankings  \n",
-        "\n> **How to read this report:** Percentages marked as proficiency or benchmark attainment are reproduced from the assessment extracts.",
-        "Suppressed or unavailable values appear as “Not reported. \n",
+        "\n> **How to read this report:** Percentages marked as proficiency or benchmark attainment are reproduced from the assessment extracts. "
+        "Suppressed or unavailable values appear as “Not reported.” District rankings describe reported results only and should not be treated "
+        "as measures of district quality. Enrollment size, student population and suppression rules can affect comparisons.\n",
         "## Quick navigation\n",
         "- [Statewide grades 3-8 proficiency](#statewide-grades-3-8-proficiency)\n",
         "- [Statewide results by student group](#statewide-results-by-student-group)\n",
@@ -401,34 +587,22 @@ def main() -> int:
               "- “Not reported” means the value was absent, suppressed or could not be parsed as a number.\n",
               "- Rankings exclude suppressed and nonnumeric values. Ties are left in source-file order.\n",
               "- Confirm unusually high or low district values against the original state release before publication.\n",
-    ]
+              "- If the input directory contains multiple school years, the script defaults to the latest year found. Use `--school-year` to select one explicitly.\n"]
 
-
-    # args.output.parent.mkdir(parents=True, exist_ok=True)
-    # args.output.write_text("\n".join(lines), encoding="utf-8")
-    # print(f"Wrote Markdown report: {args.output.resolve()}")
     report_text = "\n".join(lines)
+    output_path = args.output.with_suffix(".docx" if args.format == "docx" else ".md")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    if args.format == "md":
-        output_path = args.output
-
-        if output_path.suffix.lower() != ".md":
-            output_path = output_path.with_suffix(".md")
-
+    if args.format == "docx":
+        try:
+            markdown_to_docx(report_text, output_path)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"Wrote Word report: {output_path.resolve()}")
+    else:
         output_path.write_text(report_text, encoding="utf-8")
         print(f"Wrote Markdown report: {output_path.resolve()}")
-
-    else:
-        output_path = args.output
-
-        if output_path.suffix.lower() != ".pdf":
-            output_path = output_path.with_suffix(".pdf")
-
-        markdown_to_pdf(report_text, output_path)
-        print(f"Wrote PDF report: {output_path.resolve()}")
-
     return 0
 
 
